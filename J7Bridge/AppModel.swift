@@ -196,13 +196,17 @@ final class AppModel: ObservableObject {
             handleIncomingNumber(incomingNumber)
 
         case .callActive:
+            let wasAlreadyActive = callStatus == "ACTIVE"
             callStatus = "ACTIVE"
-            log("[CALL] WIFI ACTIVE EVENT")
-            if currentDirection == .outgoing {
+            log(wasAlreadyActive ? "[CALL] WIFI ACTIVE HANDSHAKE RETRY" : "[CALL] WIFI ACTIVE EVENT")
+            if !wasAlreadyActive, currentDirection == .outgoing {
                 callKit.reportOutgoingConnected()
             }
+            // Run on every ACTIVE packet: if J7 was answered manually before
+            // iPhone Answer, a retry can now fulfill the pending CallKit action.
             callKit.fulfillAnswerIfNeeded()
             beginCallIfNeeded(direction: currentDirection ?? .incoming)
+            // Also retries engine start if the first attempt raced with teardown.
             maybeStartVoice()
 
         case .callEnd:

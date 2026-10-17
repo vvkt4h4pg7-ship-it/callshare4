@@ -25,6 +25,9 @@ final class WiFiVoiceEngine: NSObject {
     private let transport: WiFiTransport
     private let playbackQueue = DispatchQueue(label: "com.callshare.wifi.playback.r1", qos: .userInitiated)
     private let stateLock = NSLock()
+    // AVAudioEngine start/stop is not safe to interleave. CallKit may issue
+    // multiple teardown callbacks for one call while the next call is arriving.
+    private let lifecycleLock = NSLock()
 
     private var isRunning = false
     private var muted = false
@@ -103,6 +106,9 @@ final class WiFiVoiceEngine: NSObject {
     }
 
     func stop() {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+
         stateLock.lock()
         let wasRunning = isRunning
         isRunning = false
@@ -156,6 +162,9 @@ final class WiFiVoiceEngine: NSObject {
     }
 
     private func startEngine() -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+
         if runningSnapshot() { return true }
 
         do {

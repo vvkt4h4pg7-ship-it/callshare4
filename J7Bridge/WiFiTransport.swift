@@ -80,6 +80,8 @@ final class WiFiTransport {
     private var started = false
     private var coreDiscoveryTimer: DispatchSourceTimer?
     private var coreDiscoveryProbeCount: UInt64 = 0
+    private var bridgeDiscoveryProbeCount: UInt64 = 0
+    private var lastSubnetProbeAt: TimeInterval = 0
 
     init(j7Host: String = "192.168.104.12", port: UInt16 = 50005) {
         self._j7Host = j7Host
@@ -249,7 +251,14 @@ final class WiFiTransport {
         guard coreDiscoveryTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: txQueue)
         timer.schedule(deadline: .now() + .milliseconds(100), repeating: .seconds(2), leeway: .milliseconds(200))
-        timer.setEventHandler { [weak self] in self?.sendCoreDiscoveryHello() }
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            // Native audio core peer discovery remains on 50005.
+            self.sendCoreDiscoveryHello()
+            // The Incoming Call Bridge listens on 50006 and learns the iPhone IP
+            // from this packet's UDP source address; no manual iPhone IP is needed.
+            self.sendBridgeDiscoveryHello()
+        }
         coreDiscoveryTimer = timer
         timer.resume()
     }
@@ -280,6 +289,110 @@ final class WiFiTransport {
         } else if coreDiscoveryProbeCount == 1 || coreDiscoveryProbeCount % 15 == 0 {
             onStatus?("[WIFI HYBRID] CORE HELLO #\(coreDiscoveryProbeCount) -> \(_j7Host):\(port)")
         }
+    }
+
+    private func sendBridgeDiscoveryHello() {
+        guard started, rxSocket >= 0 else { return }
+        bridgeDiscoveryProbeCount &+= 1
+        let packet = makeControlPacket(type: .hello, payload: Data())
+        let now = Date.timeIntervalSinceReferenceDate
+
+        // Re-scan the current Wi-Fi subnet every 5 s so a changed hotspot IP is found
+        // automatically. Use unicast probes rather than broadcast/multicast, which can
+        // be restricted on iOS. The J7 bridge replies to our bound RX port 50005.
+        if now - lastSubnetProbeAt >= 5.0 {
+            let targets = localPrivateIPv4SubnetTargets()
+            var sentCount = 0
+            for host in targets {
+                if sendDatagramFromRXSocket(packet, host: host, port: controlTxPort) { sentCount += 1 }
+            }
+            lastSubnetProbeAt = now
+            onStatus?("[WIFI AUTO] SUBNET PROBE #\(bridgeDiscoveryProbeCount) targets=\(targets.count) sent=\(sentCount) port=\(controlTxPort)")
+        } else if isPrivateIPv4(_j7Host) {
+            let sent = sendDatagramFromRXSocket(packet, host: _j7Host, port: controlTxPort)
+            if bridgeDiscoveryProbeCount == 1 || bridgeDiscoveryProbeCount % 15 == 0 {
+                onStatus?("[WIFI AUTO] BRIDGE HELLO #\(bridgeDiscoveryProbeCount) -> \(_j7Host):\(controlTxPort) sent=\(sent)")
+            }
+        }
+    }
+
+    /// Finds host addresses on the active Wi-Fi IPv4 subnet (normally iOS `en0`).
+    /// Subnets larger than 1,022 hosts are skipped to keep discovery bounded.
+    private func localPrivateIPv4SubnetTargets() -> [String] {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let first = ifaddr else { return [] }
+        defer { freeifaddrs(first) }
+
+        var candidates: [(name: String, ip: UInt32, mask: UInt32)] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            let entry = current.pointee
+            let name = String(cString: entry.ifa_name)
+            if name == "en0" || name.hasPrefix("en") {
+                if let address = entry.ifa_addr,
+                   let netmask = entry.ifa_netmask,
+                   address.pointee.sa_family == sa_family_t(AF_INET),
+                   netmask.pointee.sa_family == sa_family_t(AF_INET) {
+                    let addrIn = UnsafeRawPointer(address).assumingMemoryBound(to: sockaddr_in.self).pointee
+                    let maskIn = UnsafeRawPointer(netmask).assumingMemoryBound(to: sockaddr_in.self).pointee
+                    let ip = UInt32(bigEndian: addrIn.sin_addr.s_addr)
+                    let mask = UInt32(bigEndian: maskIn.sin_addr.s_addr)
+                    if isPrivateIPv4(ip) { candidates.append((name, ip, mask)) }
+                }
+            }
+            cursor = entry.ifa_next
+        }
+
+        // Prefer the primary Wi-Fi interface. Ignore unrelated VPN/AWDL subnets.
+        let selected = candidates.first(where: { $0.name == "en0" })
+            ?? candidates.first(where: { $0.name.hasPrefix("en") })
+        guard let selected else { return [] }
+        let network = selected.ip & selected.mask
+        let broadcast = network | ~selected.mask
+        guard broadcast > network + 1 else { return [] }
+        let hostCount = Int(broadcast - network - 1)
+        guard hostCount <= 1022 else {
+            onStatus?("[WIFI AUTO] SUBNET PROBE skipped: subnet has \(hostCount) hosts")
+            return []
+        }
+
+        var targets: [String] = []
+        targets.reserveCapacity(hostCount)
+        if network + 1 < broadcast {
+            for value in (network + 1)..<broadcast where value != selected.ip {
+                targets.append(ipv4String(fromValue: value))
+            }
+        }
+        return targets
+    }
+
+    private func isPrivateIPv4(_ value: UInt32) -> Bool {
+        let a = Int((value >> 24) & 0xff)
+        let b = Int((value >> 16) & 0xff)
+        return a == 10 || (a == 172 && (16...31).contains(b)) || (a == 192 && b == 168)
+    }
+
+    private func ipv4String(fromValue value: UInt32) -> String {
+        "\((value >> 24) & 0xff).\((value >> 16) & 0xff).\((value >> 8) & 0xff).\(value & 0xff)"
+    }
+
+    @discardableResult
+    private func sendDatagramFromRXSocket(_ packet: Data, host: String, port targetPort: UInt16) -> Bool {
+        guard rxSocket >= 0 else { return false }
+        var destination = sockaddr_in()
+        destination.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        destination.sin_family = sa_family_t(AF_INET)
+        destination.sin_port = targetPort.bigEndian
+        guard host.withCString({ inet_pton(AF_INET, $0, &destination.sin_addr) }) == 1 else { return false }
+        let sent = packet.withUnsafeBytes { bytes -> Int in
+            guard let base = bytes.baseAddress else { return -1 }
+            return withUnsafePointer(to: &destination) { address in
+                address.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    sendto(rxSocket, base, packet.count, 0, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+        return sent == packet.count
     }
 
     private func startListener() {
@@ -392,13 +505,20 @@ final class WiFiTransport {
         // Cold-start discovery beacon emitted by the J7 helper app.
         if Array(bytes[0..<4]) == Self.controlMagic,
            bytes.count >= Self.controlHeaderSize,
-           bytes[4] == Self.version,
-           bytes[5] == Control.pong.rawValue {
+           bytes[4] == Self.version {
             let payloadLength = Int(readLE16(bytes, 10))
             guard payloadLength == bytes.count - Self.controlHeaderSize else { return nil }
+            let type = bytes[5]
             let payload = Data(bytes[Self.controlHeaderSize..<bytes.count])
-            guard String(data: payload, encoding: .utf8) == "CALLSHARE_DISCOVERY_R1" else { return nil }
-            return "J7WC discovery beacon"
+            if type == Control.pong.rawValue,
+               String(data: payload, encoding: .utf8) == "CALLSHARE_DISCOVERY_R1" {
+                return "J7WC discovery beacon"
+            }
+            // If the first received packet is already a RING/ACTIVE/END event,
+            // use its source IP to learn J7 too (e.g. if the beacon was missed).
+            if type == Control.incomingCall.rawValue || type == Control.callActive.rawValue || type == Control.callEnd.rawValue {
+                return "J7WC call-state packet"
+            }
         }
         return nil
     }

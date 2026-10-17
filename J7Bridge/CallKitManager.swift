@@ -6,6 +6,7 @@ final class CallKitManager: NSObject {
     private let provider: CXProvider
     private var currentUUID: UUID?
     private var answerAction: CXAnswerCallAction?
+    private var loggedActiveWithoutAnswer = false
 
     var onStart: ((String) -> Void)?
     var onAnswer: (() -> Void)?
@@ -85,9 +86,13 @@ final class CallKitManager: NSObject {
 
     func fulfillAnswerIfNeeded() {
         guard let action = answerAction else {
-            onLog?("[CALLKIT] CALL_ACTIVE received with no pending Answer action")
+            if !loggedActiveWithoutAnswer {
+                onLog?("[CALLKIT] CALL_ACTIVE received with no pending Answer action")
+                loggedActiveWithoutAnswer = true
+            }
             return
         }
+        loggedActiveWithoutAnswer = false
         onLog?("[CALLKIT] ANSWER FULFILLED after J7 CALL_ACTIVE confirmation")
         action.fulfill()
         answerAction = nil
@@ -108,12 +113,14 @@ final class CallKitManager: NSObject {
         provider.reportCall(with: uuid, endedAt: Date(), reason: reason)
         currentUUID = nil
         answerAction = nil
+        loggedActiveWithoutAnswer = false
         onAudioDeactivated?()
     }
 
     func clearCurrentCall() {
         currentUUID = nil
         answerAction = nil
+        loggedActiveWithoutAnswer = false
     }
 }
 
@@ -131,6 +138,7 @@ extension CallKitManager: CXProviderDelegate {
     func providerDidReset(_ provider: CXProvider) {
         currentUUID = nil
         answerAction = nil
+        loggedActiveWithoutAnswer = false
         onAudioDeactivated?()
         onLog?("[CALLKIT] provider reset")
     }
@@ -145,6 +153,7 @@ extension CallKitManager: CXProviderDelegate {
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         answerAction = action
+        loggedActiveWithoutAnswer = false
         onLog?("[CALLKIT] ANSWER action -> J7 Wi-Fi; waiting for CALL_ACTIVE")
         onAnswer?()
     }
